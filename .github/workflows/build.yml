@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: gradle -p android assembleDebug --no-daemon
+
+      - name: Name the APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk PhoneTablet.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneTablet-apk
+          path: PhoneTablet.apk
+
+  windows:
+    name: Windows server (exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r server/requirements.txt pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --name PhoneTabletServer server/tablet_server.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhoneTabletServer-exe
+          path: dist/PhoneTabletServer.exe
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/PhoneTablet-apk/PhoneTablet.apk
+            dist/PhoneTabletServer-exe/PhoneTabletServer.exe

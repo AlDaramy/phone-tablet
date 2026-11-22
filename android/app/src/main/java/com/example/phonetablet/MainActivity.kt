@@ -1,226 +1,33 @@
 package com.example.phonetablet
 
-import android.content.Context
 import android.content.pm.ActivityInfo
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.view.MotionEvent
+import android.text.InputType
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import java.io.DataInputStream
-import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.util.concurrent.LinkedBlockingQueue
-
-private const val DOWN: Byte = 0
-private const val MOVE: Byte = 1
-private const val UP: Byte = 2
-private const val HOVER: Byte = 3
-private const val LEAVE: Byte = 4
-private const val RESIZE: Byte = 10
-
-/**
- * One TCP connection, both directions:
- *  - sends 13-byte packets (type, x, y, pressure) to the Windows server
- *  - receives screen frames: [4-byte length][JPEG] and hands them to onFrame
- */
-class Connection(
-    private val host: String,
-    private val port: Int,
-    private val onConnected: () -> Unit,
-    private val onFrame: (Bitmap) -> Unit,
-    private val onClosed: (String) -> Unit,
-) {
-    private val queue = LinkedBlockingQueue<ByteArray>()
-    @Volatile private var running = true
-    @Volatile private var socket: Socket? = null
-
-    fun start() {
-        Thread {
-            try {
-                val s = Socket()
-                s.tcpNoDelay = true
-                s.connect(InetSocketAddress(host, port), 4000)
-                socket = s
-                onConnected()
-                Thread { readLoop(s) }.apply { isDaemon = true }.start()
-                writeLoop(s)
-            } catch (e: Exception) {
-                fail(e.message ?: "Connection failed")
-            }
-        }.apply { isDaemon = true }.start()
-    }
-
-    private fun writeLoop(s: Socket) {
-        val out = s.getOutputStream().buffered()
-        while (running) {
-            val packet = queue.take()
-            if (!running) break
-            out.write(packet)
-            if (queue.isEmpty()) out.flush()
-        }
-    }
-
-    private fun readLoop(s: Socket) {
-        try {
-            val input = DataInputStream(s.getInputStream().buffered(1 shl 16))
-            while (running) {
-                val len = input.readInt()
-                if (len <= 0 || len > 20_000_000) throw IOException("Bad frame size")
-                val data = ByteArray(len)
-                input.readFully(data)
-                val bmp = BitmapFactory.decodeByteArray(data, 0, len) ?: continue
-                onFrame(bmp)
-            }
-        } catch (e: Exception) {
-            fail(e.message ?: "Server closed the connection")
-        }
-    }
-
-    @Synchronized
-    private fun fail(reason: String) {
-        if (!running) return
-        running = false
-        try { socket?.close() } catch (_: Exception) {}
-        queue.offer(ByteArray(0))
-        onClosed(reason)
-    }
-
-    fun send(type: Byte, x: Float, y: Float, pressure: Float) {
-        if (!running) return
-        queue.offer(
-            ByteBuffer.allocate(13).put(type).putFloat(x).putFloat(y).putFloat(pressure).array()
-        )
-    }
-
-    fun close() {
-        running = false
-        try { socket?.close() } catch (_: Exception) {}
-        queue.offer(ByteArray(0)) // wake the writer thread
-    }
-}
-
-/**
- * Shows the laptop screen (letterboxed) and turns touch / stylus input into
- * pen packets, with coordinates relative to the displayed screen image.
- */
-class TabletView(context: Context, private val conn: Connection) : View(context) {
-    @Volatile private var frame: Bitmap? = null
-    private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val dst = RectF()
-    private var activeId = -1
-
-    init {
-        setBackgroundColor(Color.BLACK)
-    }
-
-    fun setFrame(b: Bitmap) {
-        frame = b
-        postInvalidateOnAnimation()
-    }
-
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        // Tell the server how big the phone screen is so it can downscale frames.
-        conn.send(RESIZE, w.toFloat(), h.toFloat(), 0f)
-    }
-
-    /** Fit the frame inside the view, centered, keeping its aspect ratio. */
-    private fun updateRect(f: Bitmap) {
-        val scale = minOf(width.toFloat() / f.width, height.toFloat() / f.height)
-        val w = f.width * scale
-        val h = f.height * scale
-        val left = (width - w) / 2f
-        val top = (height - h) / 2f
-        dst.set(left, top, left + w, top + h)
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val f = frame ?: return
-        updateRect(f)
-        canvas.drawBitmap(f, null, dst, paint)
-    }
-
-    private fun nx(v: Float) = ((v - dst.left) / dst.width()).coerceIn(0f, 1f)
-    private fun ny(v: Float) = ((v - dst.top) / dst.height()).coerceIn(0f, 1f)
-
-    private fun pressureOf(e: MotionEvent, idx: Int, raw: Float): Float =
-        if (e.getToolType(idx) == MotionEvent.TOOL_TYPE_STYLUS) raw.coerceIn(0f, 1f) else 0.5f
-
-    override fun onTouchEvent(e: MotionEvent): Boolean {
-        val f = frame ?: return true // nothing to draw on yet
-        updateRect(f)
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                activeId = e.getPointerId(0)
-                conn.send(DOWN, nx(e.getX(0)), ny(e.getY(0)), pressureOf(e, 0, e.getPressure(0)))
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val idx = e.findPointerIndex(activeId)
-                if (idx < 0) return true
-                for (h in 0 until e.historySize) {
-                    conn.send(
-                        MOVE,
-                        nx(e.getHistoricalX(idx, h)),
-                        ny(e.getHistoricalY(idx, h)),
-                        pressureOf(e, idx, e.getHistoricalPressure(idx, h)),
-                    )
-                }
-                conn.send(MOVE, nx(e.getX(idx)), ny(e.getY(idx)), pressureOf(e, idx, e.getPressure(idx)))
-            }
-            MotionEvent.ACTION_POINTER_UP -> {
-                // Extra fingers (palm, etc.) are ignored unless it is the drawing pointer.
-                if (e.getPointerId(e.actionIndex) == activeId) {
-                    val i = e.actionIndex
-                    conn.send(UP, nx(e.getX(i)), ny(e.getY(i)), 0f)
-                    activeId = -1
-                }
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (activeId != -1) {
-                    conn.send(UP, nx(e.getX(0)), ny(e.getY(0)), 0f)
-                    activeId = -1
-                }
-            }
-        }
-        return true
-    }
-
-    // Stylus hover (devices that support it)
-    override fun onHoverEvent(e: MotionEvent): Boolean {
-        val f = frame ?: return true
-        updateRect(f)
-        when (e.actionMasked) {
-            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE ->
-                conn.send(HOVER, nx(e.x), ny(e.y), 0f)
-            MotionEvent.ACTION_HOVER_EXIT ->
-                conn.send(LEAVE, nx(e.x), ny(e.y), 0f)
-        }
-        return true
-    }
-}
 
 class MainActivity : AppCompatActivity() {
-    private var conn: Connection? = null
-    private var tabletShown = false
-    @Volatile private var frameSink: ((Bitmap) -> Unit)? = null
-    private lateinit var status: TextView
+    private var session: Session? = null
+    private var tabletView: TabletView? = null
+    private var overlay: TextView? = null
+    private var screenButton: Button? = null
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -229,10 +36,8 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (tabletShown) {
-                    conn?.close()
-                    conn = null
-                    showForm()
+                if (tabletView != null) {
+                    leaveTablet("")
                 } else {
                     finish()
                 }
@@ -240,84 +45,280 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun showForm() {
-        tabletShown = false
-        frameSink = null
+    // ============================== connect form =======================================
+    private fun showForm(message: String = "") {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         setSystemBars(visible = true)
         val prefs = getSharedPreferences("tablet", MODE_PRIVATE)
 
-        val pad = (24 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
+            setPadding(dp(24), dp(24), dp(24), dp(24))
         }
+        root.addView(TextView(this).apply {
+            text = "Phone Tablet"
+            textSize = 22f
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        val hostRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val host = EditText(this).apply {
-            hint = "Server IP  (USB: 127.0.0.1)"
-            setText(prefs.getString("host", "127.0.0.1"))
+            hint = "PC address  (USB: 127.0.0.1)"
+            setText(prefs.getString("host", ""))
             setSingleLine()
         }
+        val scan = Button(this).apply {
+            text = "Scan"
+            isAllCaps = false
+        }
+        hostRow.addView(host, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        hostRow.addView(scan)
+        root.addView(hostRow)
+
+        val found = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(found)
+
         val port = EditText(this).apply {
             hint = "Port"
-            setText(prefs.getString("port", "5555"))
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(prefs.getString("port", Proto.DEFAULT_PORT.toString()))
+            inputType = InputType.TYPE_CLASS_NUMBER
             setSingleLine()
         }
-        val button = Button(this).apply { text = "Connect" }
-        status = TextView(this).apply {
-            text = "Enter the address shown by the Windows server."
-            setPadding(0, pad / 2, 0, 0)
+        val pin = EditText(this).apply {
+            hint = "PIN shown on the PC (6 digits)"
+            setText(prefs.getString("pin", ""))
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine()
         }
-        root.addView(host)
+        val connect = Button(this).apply {
+            text = "Connect"
+            isAllCaps = false
+        }
+        val status = TextView(this).apply {
+            text = if (message.isNotEmpty()) message else "Run the server on the PC, then tap Scan."
+            setPadding(0, dp(12), 0, 0)
+        }
         root.addView(port)
-        root.addView(button)
+        root.addView(pin)
+        root.addView(connect)
         root.addView(status)
-        setContentView(root)
+        setContentView(ScrollView(this).apply { addView(root) })
 
-        button.setOnClickListener {
-            val h = host.text.toString().trim()
-            val p = port.text.toString().trim().toIntOrNull() ?: 5555
-            prefs.edit().putString("host", h).putString("port", p.toString()).apply()
-            status.text = "Connecting to $h:$p ..."
-            button.isEnabled = false
-
-            lateinit var c: Connection
-            c = Connection(
-                h, p,
-                onConnected = { runOnUiThread { conn = c; showTablet(c) } },
-                onFrame = { bmp -> frameSink?.invoke(bmp) },
-                onClosed = { reason ->
-                    runOnUiThread {
-                        if (conn === c || conn == null) {
-                            conn = null
-                            showForm()
-                            status.text = "Not connected: $reason"
+        scan.setOnClickListener {
+            scan.isEnabled = false
+            status.text = "Searching the Wi-Fi network..."
+            found.removeAllViews()
+            Discovery.scan(this) { list ->
+                runOnUiThread {
+                    scan.isEnabled = true
+                    if (list.isEmpty()) {
+                        status.text = "No PC found. Is the server running and on the same Wi-Fi? " +
+                            "You can also type the address."
+                    } else {
+                        status.text = "Tap your PC:"
+                        for (s in list) {
+                            found.addView(Button(this).apply {
+                                text = "${s.name}  (${s.host})" + if (s.needsPin) "  - PIN" else ""
+                                isAllCaps = false
+                                setOnClickListener {
+                                    host.setText(s.host)
+                                    port.setText(s.port.toString())
+                                    if (s.needsPin) pin.requestFocus()
+                                }
+                            })
                         }
                     }
-                },
-            )
-            c.start()
+                }
+            }
+        }
+
+        connect.setOnClickListener {
+            val h = host.text.toString().trim()
+            val p = port.text.toString().trim().toIntOrNull() ?: Proto.DEFAULT_PORT
+            val pinText = pin.text.toString().trim()
+            if (h.isEmpty()) {
+                status.text = "Enter the PC address or tap Scan."
+                return@setOnClickListener
+            }
+            prefs.edit().putString("host", h).putString("port", p.toString())
+                .putString("pin", pinText).apply()
+            status.text = "Connecting to $h:$p ..."
+            connect.isEnabled = false
+            connectTo(h, p, pinText.toIntOrNull() ?: 0)
         }
     }
 
-    private fun showTablet(c: Connection) {
-        tabletShown = true
+    private fun connectTo(host: String, port: Int, pin: Int) {
+        session?.close()
+        lateinit var s: Session
+        s = Session(host, port, pin, object : Session.Callbacks {
+            override fun onReady() {
+                if (session === s) handleReady()
+            }
+
+            override fun onFrame(frame: FrameInfo) {
+                if (session !== s) return
+                tabletView?.let { v -> v.post { v.applyFrame(frame) } }
+            }
+
+            override fun onState(text: String) {
+                if (session === s) showOverlay(text)
+            }
+
+            override fun onFailed(reason: String) {
+                if (session === s) leaveTablet("Not connected: $reason")
+            }
+        })
+        session = s
+        s.start()
+    }
+
+    private fun handleReady() {
+        val view = tabletView
+        if (view == null) {
+            showTablet()
+        } else {
+            overlay?.visibility = View.GONE
+            view.sendInitialState()
+        }
+    }
+
+    private fun leaveTablet(message: String) {
+        session?.close()
+        session = null
+        tabletView?.release()
+        tabletView = null
+        overlay = null
+        screenButton = null
+        showForm(message)
+    }
+
+    private fun showOverlay(message: String) {
+        val note = overlay ?: return
+        note.text = message
+        note.visibility = View.VISIBLE
+    }
+
+    // ============================== tablet screen ======================================
+    private fun showTablet() {
+        val s = session ?: return
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         setSystemBars(visible = false)
-        val view = TabletView(this, c)
-        frameSink = { bmp -> view.setFrame(bmp) }
-        setContentView(view)
+
+        val root = FrameLayout(this)
+        val view = TabletView(this, s)
+        root.addView(view, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(buildToolbar(view, s), FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START))
+
+        val note = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = rounded(0xCC000000.toInt())
+            visibility = View.GONE
+        }
+        root.addView(note, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+
+        view.onInfo = { idx, count ->
+            screenButton?.apply {
+                text = "Screen $idx/$count"
+                visibility = if (count > 1) View.VISIBLE else View.GONE
+            }
+        }
+        tabletView = view
+        overlay = note
+        setContentView(root)
+        view.sendInitialState()
+    }
+
+    private fun rounded(color: Int) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(8).toFloat()
+    }
+
+    private fun toolButton(label: String, onClick: (Button) -> Unit): Button =
+        Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            minWidth = 0
+            minHeight = 0
+            minimumWidth = 0
+            minimumHeight = 0
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = rounded(0xCC202020.toInt())
+            setOnClickListener { onClick(this) }
+        }
+
+    private fun buildToolbar(view: TabletView, s: Session): View {
+        fun key(action: Int) = s.send(Proto.KEY, action.toFloat(), 0f, 0f)
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), 0, dp(4), dp(4))
+        }
+        fun add(b: Button) {
+            panel.addView(b, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) })
+        }
+
+        add(toolButton("Undo") { key(Proto.ACT_UNDO) })
+        add(toolButton("Redo") { key(Proto.ACT_REDO) }.apply {
+            // long press = Ctrl+Shift+Z (the redo shortcut in Krita / Photoshop)
+            setOnLongClickListener { key(Proto.ACT_REDO_ALT); true }
+        })
+        add(toolButton("Eraser") { key(Proto.ACT_ERASER) })
+        add(toolButton("Brush") { key(Proto.ACT_BRUSH) })
+        add(toolButton("Size -") { key(Proto.ACT_BRUSH_SMALLER) })
+        add(toolButton("Size +") { key(Proto.ACT_BRUSH_BIGGER) })
+        add(toolButton("Save") { key(Proto.ACT_SAVE) })
+        add(toolButton("Fit") { view.fitView() })
+        add(toolButton("Window") { view.snapWindow() })
+        val screen = toolButton("Screen") { view.nextMonitor() }.apply { visibility = View.GONE }
+        screenButton = screen
+        add(screen)
+        add(toolButton("Finger: Draw") { b ->
+            view.fingerDraws = !view.fingerDraws
+            b.text = if (view.fingerDraws) "Finger: Draw" else "Finger: Pan"
+        })
+        add(toolButton("Exit") { leaveTablet("") })
+
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(panel)
+        }
+        val toggle = toolButton("Menu") { b ->
+            val show = scroll.visibility != View.VISIBLE
+            scroll.visibility = if (show) View.VISIBLE else View.GONE
+            b.text = if (show) "Hide" else "Menu"
+        }.apply { text = "Hide" }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(4), 0, 0)
+            addView(toggle, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(scroll, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, 0, 1f))
+        }
     }
 
     private fun setSystemBars(visible: Boolean) {
         val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         if (visible) controller.show(WindowInsetsCompat.Type.systemBars())
         else controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
     override fun onDestroy() {
-        conn?.close()
+        session?.close()
         super.onDestroy()
     }
 }

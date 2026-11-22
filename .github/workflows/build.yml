@@ -11,6 +11,20 @@ permissions:
   contents: write
 
 jobs:
+  server-tests:
+    name: Server protocol tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install Pillow
+
+      - run: python server/test_protocol.py
+
   android:
     name: Android APK
     runs-on: ubuntu-latest
@@ -50,8 +64,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r server/requirements.txt pyinstaller
 
-      - name: Build exe
-        run: pyinstaller --onefile --name PhoneTabletServer server/tablet_server.py
+      - name: Build exe (windowed, with the settings window)
+        run: pyinstaller --onefile --windowed --name PhoneTabletServer server/tablet_server.py
 
       - uses: actions/upload-artifact@v4
         with:
@@ -61,7 +75,7 @@ jobs:
   release:
     name: Publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [android, windows]
+    needs: [server-tests, android, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
